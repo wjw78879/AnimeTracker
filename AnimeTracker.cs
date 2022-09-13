@@ -2,6 +2,8 @@
 using System.Web;
 using System.Xml;
 using System.Security.Cryptography;
+using System.ServiceModel.Syndication;
+using System.Runtime.Serialization;
 
 namespace UNISLAND.AnimeTracker
 {
@@ -29,6 +31,19 @@ namespace UNISLAND.AnimeTracker
             public DateTime PublishDate { get; set; }
             public string TorrentUrl { get; set; }
             public ulong Size { get; set; }
+        }
+
+        [DataContract(Name = "torrent", Namespace = "https://mikanani.me/0.1/")]
+        class MikanTorrent
+        {
+            [DataMember(IsRequired = true, Name = "link", Order = 0)]
+            public string? Link;
+
+            [DataMember(IsRequired = true, Name = "contentLength", Order = 1)]
+            public ulong ContentLength;
+
+            [DataMember(IsRequired = true, Name = "pubDate", Order = 2)]
+            public DateTime PubDate;
         }
 
         readonly Configs m_configs;
@@ -180,11 +195,13 @@ namespace UNISLAND.AnimeTracker
                 Stream content = await m_client.GetStreamAsync(url);
 
                 using XmlReader reader = XmlReader.Create(content, new XmlReaderSettings { Async = true });
-                while (await reader.ReadAsync())
+
+                SyndicationFeed feed = SyndicationFeed.Load(reader);
+
+                foreach (SyndicationItem item in feed.Items)
                 {
-                    if (reader.Name == "item")
+                    if (TryReadAnime(item, out Anime anime))
                     {
-                        Anime anime = await ReadAnime(reader.ReadSubtree());
                         if (!m_history.Contains(anime.Hash))
                         {
                             list.Add(anime);
@@ -204,42 +221,54 @@ namespace UNISLAND.AnimeTracker
             return list;
         }
 
-        static async Task<Anime> ReadAnime(XmlReader subTree)
+        static bool TryReadAnime(SyndicationItem item, out Anime anime)
         {
-            Anime anime = new Anime();
-            while (await subTree.ReadAsync())
+            MikanTorrent? torrent = null;
+            foreach (SyndicationElementExtension extension in item.ElementExtensions)
             {
-                if (subTree.NodeType != XmlNodeType.Element)
+                try
                 {
-                    continue;
+                    torrent = extension.GetObject<MikanTorrent>();
                 }
+                catch (Exception) { }
 
-                if (subTree.Name == "guid" && await subTree.ReadAsync() && subTree.NodeType == XmlNodeType.Text)
+                if (torrent != null)
                 {
-                    anime.Hash = Convert.ToHexString(SHA1.HashData(Encoding.Unicode.GetBytes(subTree.Value)));
-                }
-                else if (subTree.Name == "title" && await subTree.ReadAsync() && subTree.NodeType == XmlNodeType.Text)
-                {
-                    anime.Title = subTree.Value;
-                }
-                else if (subTree.Name == "pubDate" && await subTree.ReadAsync() && subTree.NodeType == XmlNodeType.Text)
-                {
-                    anime.PublishDate = DateTime.Parse(subTree.Value);
-                }
-                else if (subTree.Name == "enclosure")
-                {
-                    string? url = subTree.GetAttribute("url");
-                    if (url != null)
-                    {
-                        anime.TorrentUrl = url;
-                    }
-                }
-                else if (subTree.Name == "contentLength" && await subTree.ReadAsync() && subTree.NodeType == XmlNodeType.Text)
-                {
-                    anime.Size = ulong.Parse(subTree.Value);
+                    break;
                 }
             }
-            return anime;
+
+            if (torrent == null)
+            {
+                anime = default;
+                return false;
+            }
+
+            string? torrentUrl = null;
+            foreach (SyndicationLink link in item.Links)
+            {
+                if (link.RelationshipType == "enclosure")
+                {
+                    torrentUrl = link.Uri.AbsoluteUri;
+                    break;
+                }
+            }
+
+            if (torrentUrl == null)
+            {
+                anime = default;
+                return false;
+            }
+
+            anime = new Anime()
+            {
+                Hash = Convert.ToHexString(SHA1.HashData(Encoding.Unicode.GetBytes(item.Id))),
+                Title = item.Title.Text,
+                PublishDate = torrent.PubDate,
+                TorrentUrl = torrentUrl,
+                Size = torrent.ContentLength
+            };
+            return true;
         }
 
         static Configs ReadConfigs()
