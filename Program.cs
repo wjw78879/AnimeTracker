@@ -8,11 +8,11 @@ namespace UNISLAND.AnimeTracker
 
     static class Program
     {
-        static async Task Main()
+        static void Main()
         {
-            await TestSyndication();
-            //AnimeTracker animeTracker = new AnimeTracker();
-            //animeTracker.Run();
+            //await TestSyndication();
+            AnimeTracker animeTracker = new AnimeTracker();
+            animeTracker.Run();
         }
 
         static async Task TestSyndication()
