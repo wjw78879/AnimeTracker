@@ -55,6 +55,8 @@ namespace UNISLAND.AnimeTracker
         readonly HttpClient m_client;
         readonly Downloader m_downloader;
 
+        (DateTime, string) m_lastFetch;
+
         bool m_isFetching;
         int m_nextTrack;
 
@@ -68,6 +70,8 @@ namespace UNISLAND.AnimeTracker
             m_client.Timeout = new TimeSpan(m_configs.HttpRequestTimeoutMilliseconds * 10000);
             m_downloader = new Downloader(m_configs.TorrentPath, m_configs.ExecutablePath, m_configs.HttpRequestTimeoutMilliseconds);
 
+            m_lastFetch = (DateTime.MinValue, "");
+
             m_isFetching = false;
             m_nextTrack = 0;
         }
@@ -80,7 +84,7 @@ namespace UNISLAND.AnimeTracker
         public void Run()
         {
             using CancellationTokenSource cts = new CancellationTokenSource();
-            _ = FetchAll();
+            //_ = FetchAll();
             Task loopTask = FetchLoop(cts.Token);
             bool cancel = false;
             while (true)
@@ -91,14 +95,27 @@ namespace UNISLAND.AnimeTracker
                     switch (cmd)
                     {
                         case "help":
+                            Console.WriteLine();
                             Console.WriteLine("help: show help");
                             Console.WriteLine("reload: reload tracks");
-                            Console.WriteLine("fetchall: fetch all immediately");
+                            Console.WriteLine("fetchnext: fetch next track immediately");
+                            Console.WriteLine("fetchall: fetch all tracks immediately");
+                            Console.WriteLine("lastfetch: show info of last fetch");
                             Console.WriteLine("quit: quit anime tracker");
                             break;
                         case "reload":
                             m_tracks = ReadTracks();
                             m_nextTrack = 0;
+                            break;
+                        case "fetchnext":
+                            if (m_isFetching)
+                            {
+                                Console.WriteLine("Fetching in progress. Please try again later.");
+                            }
+                            else
+                            {
+                                _ = FetchNext(true);
+                            }
                             break;
                         case "fetchall":
                             if (m_isFetching)
@@ -108,6 +125,24 @@ namespace UNISLAND.AnimeTracker
                             else
                             {
                                 _ = FetchAll();
+                            }
+                            break;
+                        case "lastfetch":
+                            if (m_lastFetch.Item1 == DateTime.MinValue)
+                            {
+                                Console.WriteLine("No fetch history.");
+                            }
+                            else
+                            {
+                                Console.Write($"Last fetched at {m_lastFetch.Item1}, fetched: ");
+                                if (m_lastFetch.Item2 == "")
+                                {
+                                    Console.WriteLine("all tracks");
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"keywords: {m_lastFetch.Item2}");
+                                }
                             }
                             break;
                         case "quit":
@@ -154,16 +189,24 @@ namespace UNISLAND.AnimeTracker
             }
         }
 
-        async Task FetchNext()
+        async Task FetchNext(bool log = false)
         {
             if (m_tracks.Count == 0)
             {
+                if (log)
+                {
+                    Console.WriteLine("No tracks found.");
+                }
                 return;
             }
 
             m_isFetching = true;
             List<string> hashList = new List<string>();
             Track track = m_tracks[m_nextTrack];
+            if (log)
+            {
+                Console.WriteLine($"Fetching keywords: {track.Keywords}...");
+            }
             string url = "https://mikanani.me/RSS/Search?searchstr=" + HttpUtility.UrlEncode(track.Keywords);
             List<Anime>? newAnime = await FetchAnimeList(url);
             if (newAnime == null)
@@ -191,6 +234,12 @@ namespace UNISLAND.AnimeTracker
             }
 
             WriteHistory(hashList);
+            if (log)
+            {
+                Console.WriteLine($"Fetch complete. {hashList.Count} new anime found.");
+                Console.WriteLine();
+            }
+            m_lastFetch = (DateTime.Now, track.Keywords);
             m_isFetching = false;
         }
 
@@ -235,6 +284,7 @@ namespace UNISLAND.AnimeTracker
             Console.WriteLine($"Fetch complete. {hashList.Count} new anime found, {hashList.Count - fails} success, {fails} failed.");
             Console.WriteLine();
             m_nextTrack = 0;
+            m_lastFetch = (DateTime.Now, "");
             m_isFetching = false;
         }
 
