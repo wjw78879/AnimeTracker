@@ -14,8 +14,10 @@ namespace UNISLAND.AnimeTracker
             public string TorrentPath { get; set; }
             public string ExecutablePath { get; set; }
             public bool EarlyTerminate { get; set; }
-            public int FetchPeriodMinutes { get; set; }
+            public int FetchPeriodSeconds { get; set; }
             public int HttpRequestTimeoutMilliseconds { get; set; }
+            public int HttpRequestTries { get; set; }
+            public bool SkipFailures { get; set; }
         }
 
         struct Track
@@ -54,6 +56,7 @@ namespace UNISLAND.AnimeTracker
         readonly Downloader m_downloader;
 
         bool m_isFetching;
+        int m_nextTrack;
 
         public AnimeTracker()
         {
@@ -66,6 +69,7 @@ namespace UNISLAND.AnimeTracker
             m_downloader = new Downloader(m_configs.TorrentPath, m_configs.ExecutablePath, m_configs.HttpRequestTimeoutMilliseconds);
 
             m_isFetching = false;
+            m_nextTrack = 0;
         }
         public void Dispose()
         {
@@ -76,7 +80,7 @@ namespace UNISLAND.AnimeTracker
         public void Run()
         {
             using CancellationTokenSource cts = new CancellationTokenSource();
-            _ = FetchOnce();
+            _ = FetchAll();
             Task loopTask = FetchLoop(cts.Token);
             bool cancel = false;
             while (true)
@@ -89,20 +93,21 @@ namespace UNISLAND.AnimeTracker
                         case "help":
                             Console.WriteLine("help: show help");
                             Console.WriteLine("reload: reload tracks");
-                            Console.WriteLine("fetch: fetch immediately");
+                            Console.WriteLine("fetchall: fetch all immediately");
                             Console.WriteLine("quit: quit anime tracker");
                             break;
                         case "reload":
                             m_tracks = ReadTracks();
+                            m_nextTrack = 0;
                             break;
-                        case "fetch":
+                        case "fetchall":
                             if (m_isFetching)
                             {
                                 Console.WriteLine("Fetching in progress. Please try again later.");
                             }
                             else
                             {
-                                _ = FetchOnce();
+                                _ = FetchAll();
                             }
                             break;
                         case "quit":
@@ -136,7 +141,7 @@ namespace UNISLAND.AnimeTracker
         {
             while (true)
             {
-                await Task.Delay(new TimeSpan(0, m_configs.FetchPeriodMinutes, 0), token);
+                await Task.Delay(new TimeSpan(0, 0, m_configs.FetchPeriodSeconds), token);
                 if (token.IsCancellationRequested)
                 {
                     break;
@@ -144,12 +149,52 @@ namespace UNISLAND.AnimeTracker
 
                 if (!m_isFetching)
                 {
-                    await FetchOnce();
+                    await FetchNext();
                 }
             }
         }
 
-        async Task FetchOnce()
+        async Task FetchNext()
+        {
+            if (m_tracks.Count == 0)
+            {
+                return;
+            }
+
+            m_isFetching = true;
+            List<string> hashList = new List<string>();
+            Track track = m_tracks[m_nextTrack];
+            string url = "https://mikanani.me/RSS/Search?searchstr=" + HttpUtility.UrlEncode(track.Keywords);
+            List<Anime>? newAnime = await FetchAnimeList(url);
+            if (newAnime == null)
+            {
+                if (m_configs.SkipFailures)
+                {
+                    m_nextTrack = (m_nextTrack + 1) % m_tracks.Count;
+                }
+            }
+            else
+            {
+                foreach (Anime anime in newAnime)
+                {
+                    Console.WriteLine($"New anime: {anime.PublishDate}, {SizeToString(anime.Size, 1)}, {anime.Title}");
+
+                    hashList.Add(anime.Hash);
+                    m_history.Add(anime.Hash);
+                    (bool success, string message) = await m_downloader.Download(anime.TorrentUrl, track.Path);
+                    if (!success)
+                    {
+                        Console.WriteLine($"Download failed: {message}");
+                    }
+                }
+                m_nextTrack = (m_nextTrack + 1) % m_tracks.Count;
+            }
+
+            WriteHistory(hashList);
+            m_isFetching = false;
+        }
+
+        async Task FetchAll()
         {
             if (m_tracks.Count == 0)
             {
@@ -165,7 +210,12 @@ namespace UNISLAND.AnimeTracker
                 Track track = m_tracks[i];
                 Console.WriteLine($"Fetching {i + 1}/{m_tracks.Count}...");
                 string url = "https://mikanani.me/RSS/Search?searchstr=" + HttpUtility.UrlEncode(track.Keywords);
-                List<Anime> newAnime = await FetchAnimeList(url);
+                List<Anime>? newAnime = await FetchAnimeList(url);
+                if (newAnime == null)
+                {
+                    continue;
+                }
+
                 foreach (Anime anime in newAnime)
                 {
                     Console.WriteLine($"New anime: {anime.PublishDate}, {SizeToString(anime.Size, 1)}, {anime.Title}");
@@ -184,38 +234,51 @@ namespace UNISLAND.AnimeTracker
             WriteHistory(hashList);
             Console.WriteLine($"Fetch complete. {hashList.Count} new anime found, {hashList.Count - fails} success, {fails} failed.");
             Console.WriteLine();
+            m_nextTrack = 0;
             m_isFetching = false;
         }
 
-        async Task<List<Anime>> FetchAnimeList(string url)
+        async Task<List<Anime>?> FetchAnimeList(string url)
         {
             List<Anime> list = new List<Anime>();
-            try
+            Stream? content = null;
+            for (int i = 0; i < m_configs.HttpRequestTries; i++)
             {
-                Stream content = await m_client.GetStreamAsync(url);
-
-                using XmlReader reader = XmlReader.Create(content, new XmlReaderSettings { Async = true });
-
-                SyndicationFeed feed = SyndicationFeed.Load(reader);
-
-                foreach (SyndicationItem item in feed.Items)
+                try
                 {
-                    if (TryReadAnime(item, out Anime anime))
-                    {
-                        if (!m_history.Contains(anime.Hash))
-                        {
-                            list.Add(anime);
-                        }
-                        else if (m_configs.EarlyTerminate)
-                        {
-                            break;
-                        }
-                    }
+                    content = await m_client.GetStreamAsync(url);
+                }
+                catch(Exception) { }
+
+                if (content != null)
+                {
+                    break;
                 }
             }
-            catch (Exception ex)
+
+            if (content == null)
             {
-                Console.WriteLine($"Fetching url \"{url}\" failed: {ex.Message}");
+                Console.WriteLine($"Fetching url failed after {m_configs.HttpRequestTries} tries: {url}");
+                return null;
+            }
+
+            using XmlReader reader = XmlReader.Create(content, new XmlReaderSettings { Async = true });
+
+            SyndicationFeed feed = SyndicationFeed.Load(reader);
+
+            foreach (SyndicationItem item in feed.Items)
+            {
+                if (TryReadAnime(item, out Anime anime))
+                {
+                    if (!m_history.Contains(anime.Hash))
+                    {
+                        list.Add(anime);
+                    }
+                    else if (m_configs.EarlyTerminate)
+                    {
+                        break;
+                    }
+                }
             }
 
             return list;
@@ -278,8 +341,10 @@ namespace UNISLAND.AnimeTracker
                 TorrentPath = "C:\\Users\\wjw11\\Downloads",
                 ExecutablePath = "C:\\Program Files\\BitComet\\BitComet.exe",
                 EarlyTerminate = true,
-                FetchPeriodMinutes = 10,
-                HttpRequestTimeoutMilliseconds = 30000
+                FetchPeriodSeconds = 30,
+                HttpRequestTimeoutMilliseconds = 10000,
+                HttpRequestTries = 3,
+                SkipFailures = false
             };
 
             if (File.Exists("config.txt"))
@@ -306,11 +371,11 @@ namespace UNISLAND.AnimeTracker
                                 configs.EarlyTerminate = et;
                             }
                         }
-                        else if (string.Compare(key, "fetchPeriodMinutes", true) == 0)
+                        else if (string.Compare(key, "fetchPeriodSeconds", true) == 0)
                         {
                             if (int.TryParse(value, out int p) && p > 0)
                             {
-                                configs.FetchPeriodMinutes = p;
+                                configs.FetchPeriodSeconds = p;
                             }
                         }
                         else if (string.Compare(key, "httpRequestTimeoutMilliseconds", true) == 0)
@@ -318,6 +383,20 @@ namespace UNISLAND.AnimeTracker
                             if (int.TryParse(value, out int t) && t > 0)
                             {
                                 configs.HttpRequestTimeoutMilliseconds = t;
+                            }
+                        }
+                        else if (string.Compare(key, "httpRequestTries", true) == 0)
+                        {
+                            if (int.TryParse(value, out int t) && t > 0)
+                            {
+                                configs.HttpRequestTries = t;
+                            }
+                        }
+                        else if (string.Compare(key, "skipFailures", true) == 0)
+                        {
+                            if (bool.TryParse(value, out bool s))
+                            {
+                                configs.SkipFailures= s;
                             }
                         }
                     }
